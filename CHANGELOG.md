@@ -2,6 +2,26 @@
 
 Documentation of major changes, newest first.
 
+## 2026-06-23: Module restructuring for nix-darwin support
+
+The monolithic `modules/minecraft-servers.nix` has been split into three files
+under `modules/minecraft-servers/`:
+- `common.nix` — shared option definitions, types, helpers, and platform-neutral config
+- `default.nix` — NixOS implementation (systemd services, sockets, firewall, hardening)
+- `darwin.nix` — macOS implementation (launchd daemons, activation scripts)
+
+A new flake output `darwinModules.minecraft-servers` is available for nix-darwin users.
+NixOS users are unaffected; `nixosModules.minecraft-servers` continues to work identically
+via `rakeLeaves` auto-discovery of the directory's `default.nix`.
+
+Key Darwin-specific behaviors:
+- Only tmux management is supported; systemd-socket is rejected with an assertion error
+- Default data directory is `/Users/Shared/minecraft` (vs `/srv/minecraft` on NixOS)
+- tmux sockets default to `${dataDir}/<name>/tmux.sock` (macOS has no `/run`)
+- `enableReload` / `extraReload` have no effect on macOS; a warning is emitted
+- `openFirewall` has no effect on macOS (application-level firewall is used instead)
+- Systemd hardening directives are not applicable on macOS
+
 ## 2024-06-07: Addition of systemd-sockets & deprecation of `runDir`
 
 With the addition systemd-socket server management, the `runDir` option has been deprecated.

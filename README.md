@@ -48,9 +48,17 @@ In your `flake.nix`:
 In your system configuration:
 
 ```nix
+# NixOS
 { inputs, ... }: # Make sure the flake inputs are in your system's config
 {
   imports = [ inputs.nix-minecraft.nixosModules.minecraft-servers ];
+  nixpkgs.overlays = [ inputs.nix-minecraft.overlay ];
+}
+
+# nix-darwin (macOS)
+{ inputs, ... }:
+{
+  imports = [ inputs.nix-minecraft.darwinModules.minecraft-servers ];
   nixpkgs.overlays = [ inputs.nix-minecraft.overlay ];
 }
 ```

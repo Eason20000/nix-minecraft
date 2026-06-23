@@ -46,13 +46,16 @@
         optionalAttrs isLinux (mapAttrs (n: v: callPackage v { }) (self.lib.rakeLeaves ./tests));
 
       nixosModules = self.lib.rakeLeaves ./modules;
+      darwinModules = {
+        minecraft-servers = ./modules/minecraft-servers/darwin.nix;
+      };
     in
     {
       lib = import ./lib { lib = nixpkgs.lib; };
 
       overlay = import ./overlay.nix;
       overlays.default = self.overlay;
-      inherit nixosModules;
+      inherit nixosModules darwinModules;
 
       hydraJobs = {
         checks = { inherit (self.checks) x86_64-linux; };
@@ -63,19 +66,6 @@
 
       packages = forEachSystem (
         pkgs:
-        let
-          docs = pkgs.nixosOptionsDoc {
-            inherit
-              (pkgs.lib.evalModules {
-                modules = [
-                  { _module.check = false; }
-                  nixosModules.minecraft-servers
-                ];
-              })
-              options
-              ;
-          };
-        in
         {
           inherit (self.legacyPackages.${pkgs.stdenv.system})
             vanilla-server
@@ -88,10 +78,26 @@
             nix-modrinth-prefetch
             neoforge-server
             ;
-
-          docsAsciiDoc = docs.optionsAsciiDoc;
-          docsCommonMark = docs.optionsCommonMark;
         }
+        // pkgs.lib.optionalAttrs pkgs.stdenvNoCC.isLinux (
+          let
+            docs = pkgs.nixosOptionsDoc {
+              inherit
+                (pkgs.lib.evalModules {
+                  modules = [
+                    { _module.check = false; }
+                    nixosModules.minecraft-servers
+                  ];
+                })
+                options
+                ;
+            };
+          in
+          {
+            docsAsciiDoc = docs.optionsAsciiDoc;
+            docsCommonMark = docs.optionsCommonMark;
+          }
+        )
       );
 
       checks = forEachSystem (
