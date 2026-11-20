@@ -72,6 +72,24 @@ user logs in, and they may be stopped on logout. On NixOS, user lingering can
 be enabled by setting `users.users.<name>.linger = true`. Otherwise, you can
 use `loginctl enable-linger`.
 
+### nix-darwin
+
+In your Darwin configuration:
+
+```nix
+{ inputs, ... }: # Make sure the flake inputs are in your system's config
+{
+  imports = [ inputs.nix-minecraft.darwinModules.minecraft-servers ];
+  nixpkgs.overlays = [ inputs.nix-minecraft.overlay ];
+}
+```
+
+Servers run as a dedicated hidden `_minecraft` user (uid/gid 536) and keep their
+data in `/var/lib/minecraft`. The first activation that creates the user needs
+Full Disk Access when `darwin-rebuild` runs over SSH; see the
+[nix-darwin notes](#nix-darwin-notes). There is also a
+[darwin example](./examples/darwin-single-server).
+
 ## Examples
 
 See the [examples directory](./examples/).
@@ -353,6 +371,7 @@ This `fetchurl` invocation directly fetches the mod, and can be copy-pasted to w
 [Common](./modules/common/minecraft-servers.nix)
 [Home Manager](./modules/home/minecraft-servers.nix)
 [NixOS](./modules/nixos/minecraft-servers.nix)
+[Darwin](./modules/darwin/minecraft-servers.nix)
 
 Modules for hosting multiple servers at once. All of the following are under this module.
 
@@ -376,7 +395,7 @@ The module asserts that servers with `openFirewall` set do not have conflicting 
 
 #### `dataDir`
 
-Directory to store the Minecraft servers. Defaults to `/srv/minecraft`.
+Directory to store the Minecraft servers. Defaults to `/srv/minecraft` (`/var/lib/minecraft` on nix-darwin).
 
 Each server will be under a subdirectory named after the server name, such as `/srv/minecraft/servername`.
 
@@ -385,13 +404,13 @@ Each server will be under a subdirectory named after the server name, such as `/
 Directory to place the runtime tmux sockets into. Defaults to `/run/minecraft`.
 Each server's console will be a tmux socket file in the form of servername.sock. To connect to the console, run `tmux -S /run/minecraft/servername.sock attach`, press `Ctrl + b` then `d` to detach.
 
-#### `user` (NixOS only)
+#### `user` (NixOS and Darwin)
 
-Name of the user to create and run servers under. It is recommended to leave this as the default, as it is the same user as `services.minecraft-server`.
+Name of the user to create and run servers under. It is recommended to leave this as the default, as it is the same user as `services.minecraft-server`. On Darwin this defaults to the dedicated `_minecraft` account (see the [nix-darwin notes](#nix-darwin-notes)).
 
-#### `group` (NixOS only)
+#### `group` (NixOS and Darwin)
 
-Name of the group to create and run servers under. In order to modify the server files or attach to the tmux socket, your user must be a part of this group. It is recommended to leave this as the default, as it is the same group as `services.minecraft-server`.
+Name of the group to create and run servers under. In order to modify the server files or attach to the tmux socket, your user must be a part of this group. It is recommended to leave this as the default, as it is the same group as `services.minecraft-server`. On Darwin this defaults to `_minecraft`.
 
 #### `environmentFile`
 
@@ -596,3 +615,69 @@ files."white-list.txt" = {
 ```
 
 generates a legacy `white-list.txt` that is needed for older minecraft versions (< 1.7.6)
+
+## nix-darwin notes
+
+The darwin module manages each server as a launchd daemon named
+`minecraft-server-<name>` (label `org.nixos.minecraft-server-<name>`), which
+supervises the tmux session that runs the server. Console access is the same as
+on NixOS:
+
+```console
+$ sudo -u _minecraft tmux -S /var/lib/minecraft/run/servername.sock attach
+```
+
+Logs from launchd (wrapper output, before the server opens its own log) are in
+`/var/lib/minecraft/<name>/logs/launchd.{out,err}.log`.
+
+### User and directories
+
+Servers run as the hidden `_minecraft` user (uid/gid 536, no shell) instead of
+the primary user, because a Minecraft server is not a trusted service. The user,
+group and directories are declared by the module; `createUser`, `userUid` and
+`groupGid` can be overridden.
+
+Creating the account requires Full Disk Access when `darwin-rebuild` runs over
+SSH, because macOS protects user management. Either enable *System Settings →
+General → Sharing → Remote Login → Allow full disk access for remote users*, or
+run `darwin-rebuild switch` once from a graphical session. To avoid this
+entirely, create the account beforehand and set `createUser = false`.
+
+### Managing servers
+
+```console
+$ sudo launchctl print system/org.nixos.minecraft-server-servername
+$ sudo launchctl kickstart -k system/org.nixos.minecraft-server-servername   # restart
+$ sudo launchctl bootout system/org.nixos.minecraft-server-servername       # stop
+$ sudo launchctl bootstrap system \
+    /Library/LaunchDaemons/org.nixos.minecraft-server-servername.plist      # start
+```
+
+`launchctl stop` restarts the job when `KeepAlive` is set, so use `bootout` to
+stop it. The wrapper sends the in-game `stopCommand` and waits up to 75 seconds
+before killing the tmux server.
+
+### Differences from the NixOS module
+
+- `managementSystem.systemd-socket` is not available: launchd socket activation
+  cannot hand the socket to the JVM. The module asserts that `tmux` is used.
+  `stopCommand = null` is rejected for the same reason.
+- `restart` is mapped to launchd's `KeepAlive`: `no` never restarts,
+  `always` and `on-failure` restart on a non-zero exit, and other systemd values
+  are treated as `on-failure` with a warning. Because `KeepAlive` implies
+  `RunAtLoad`, `autoStart = false` disables restarting until the job is started
+  manually.
+- `enableReload` has no effect: a changed job definition (plist) unloads and
+  reloads the daemon, which restarts the server.
+- There is no port-based firewall API. Allow the server's Java binary in the
+  macOS application firewall, for example:
+
+  ```console
+  $ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add \
+      "$(readlink -f /run/current-system/sw/bin/java)"
+  $ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp \
+      "$(readlink -f /run/current-system/sw/bin/java)"
+  ```
+
+- Launchd applies light CPU and I/O throttling unless `ProcessType` is set, so
+  the module defaults to `Interactive`.
