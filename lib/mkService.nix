@@ -268,4 +268,17 @@ in
   path = conf.path;
 
   environment = conf.environment // msConfig.environment or { };
+
+  # The lifecycle scripts are also exposed on their own so that non-systemd
+  # backends (e.g. launchd) can drive the same logic without systemd's
+  # serviceConfig. `stop` takes no arguments here; systemd passes `$MAINPID`
+  # separately in `serviceConfig.ExecStop`.
+  scripts = {
+    startPre = ExecStartPre;
+    start = ExecStart;
+    startPost = ExecStartPost;
+    stop = execStopScript;
+    stopPost = ExecStopPost;
+    reload = ExecReload;
+  };
 }
