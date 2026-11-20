@@ -89,6 +89,19 @@ let
             default = name: "${cfg.runDir}/${name}.sock";
             defaultText = literalExpression ''name: "''${cfg.runDir}/''${name}.sock"'';
           };
+          exitStatusFile = mkOption {
+            type = types.functionTo (types.nullOr types.str);
+            default = _: null;
+            internal = true;
+            description = ''
+              Function from a server name to the file its exit status is
+              written to, or `null` to not record it.
+
+              tmux forks, so a backend that cannot observe the server process
+              directly (launchd) needs this to distinguish a clean shutdown
+              from a crash.
+            '';
+          };
           _config = mkReadOnlyOption (
             name: server:
             let
@@ -104,13 +117,28 @@ let
                 STDIN_SOCKET_PATH = ms.tmux.socketPath name;
               };
               hooks = {
-                start = ''
-                  ${tmux} -S "$STDIN_SOCKET_PATH" new -d ${getExe server.package} ${server.jvmOpts}
-
-                  # HACK: PrivateUsers makes every user besides root/minecraft `nobody`, so this restores old tmux behavior
-                  # See https://github.com/Infinidoge/nix-minecraft/issues/5
-                  ${tmux} -S "$STDIN_SOCKET_PATH" server-access -aw nobody
-                '';
+                start =
+                  let
+                    statusFile = ms.tmux.exitStatusFile name;
+                    startServer =
+                      if statusFile == null then
+                        ''
+                          ${tmux} -S "$STDIN_SOCKET_PATH" new -d ${getExe server.package} ${server.jvmOpts}
+                        ''
+                      else
+                        ''
+                          ${tmux} -S "$STDIN_SOCKET_PATH" new -d ${pkgs.bash}/bin/bash -c ${escapeShellArg ''
+                            ${getExe server.package} ${server.jvmOpts}
+                            echo $? > ${escapeShellArg statusFile}
+                          ''}
+                        '';
+                  in
+                  ''
+                    ${startServer}
+                    # HACK: PrivateUsers makes every user besides root/minecraft `nobody`, so this restores old tmux behavior
+                    # See https://github.com/Infinidoge/nix-minecraft/issues/5
+                    ${tmux} -S "$STDIN_SOCKET_PATH" server-access -aw nobody
+                  '';
                 postStart = ''
                   ${pkgs.coreutils}/bin/chmod 660 "$STDIN_SOCKET_PATH"
                 '';
