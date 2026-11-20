@@ -52,6 +52,7 @@
       mkModules = path: (nixpkgs.lib.mapAttrs (_: module: import module self) (self.lib.rakeLeaves path));
 
       commonModules = mkModules ./modules/common;
+      darwinModules = mkModules ./modules/darwin;
       homeModules = mkModules ./modules/home;
       nixosModules = mkModules ./modules/nixos;
     in
@@ -60,7 +61,12 @@
 
       overlay = import ./overlay.nix;
       overlays.default = self.overlay;
-      inherit commonModules homeModules nixosModules;
+      inherit
+        commonModules
+        darwinModules
+        homeModules
+        nixosModules
+        ;
 
       hydraJobs = {
         checks = { inherit (self.checks) x86_64-linux; };
