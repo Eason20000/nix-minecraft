@@ -127,7 +127,7 @@ let
                         ''
                       else
                         ''
-                          ${tmux} -S "$STDIN_SOCKET_PATH" new -d ${pkgs.bash}/bin/bash -c ${escapeShellArg ''
+                          ${tmux} -S "$STDIN_SOCKET_PATH" new -d ${pkgs.bashNonInteractive}/bin/bash -c ${escapeShellArg ''
                             ${getExe server.package} ${server.jvmOpts}
                             echo $? > ${escapeShellArg statusFile}
                           ''}

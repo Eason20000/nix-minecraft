@@ -71,6 +71,8 @@ let
     let
       service = conf._service;
       statusFile = conf.managementSystem.tmux.exitStatusFile name;
+      # Take the socket from the service environment rather than recomputing it:
+      # this is the value the start hook actually hands to tmux.
       socketPath = service.environment.STDIN_SOCKET_PATH;
       sources = nonStoreSources conf;
       restart = restartPolicy conf;
@@ -82,7 +84,11 @@ let
       );
 
       exportEnvironment = concatStringsSep "\n" (
-        mapAttrsToList (var: value: "export ${var}=${escapeShellArg value}") service.environment
+        mapAttrsToList (var: value: "export ${var}=${escapeShellArg value}") (
+          # systemd treats a `null` environment value as "unset"; exporting an
+          # empty string would make `getenv` report it as present.
+          filterAttrs (_: value: value != null) service.environment
+        )
       );
 
       # A natural exit is the one case where launchd needs the exit status:
@@ -116,11 +122,8 @@ let
       name = "minecraft-server-${name}-launchd";
       runtimeInputs = [
         pkgs.coreutils
-        pkgs.findutils
         pkgs.gnugrep
-        pkgs.gnused
         pkgs.tmux
-        pkgs.bash
       ];
       # The generated script embeds store paths and is checked by shellcheck,
       # which would otherwise complain about quoting and non-constant sources.
@@ -138,15 +141,6 @@ let
         ''}
         ${exportEnvironment}
 
-        ${optionalString (environmentFile != null) ''
-          if [[ -f ${escapeShellArg environmentFile} ]]; then
-            set -a
-            # shellcheck disable=SC1090
-            source ${escapeShellArg environmentFile}
-            set +a
-          fi
-        ''}
-
         ${optionalString (sources != [ ]) ''
           # shellcheck disable=SC2043
           for source in ${concatStringsSep " " (map escapeShellArg sources)}; do
@@ -163,25 +157,19 @@ let
           done
         ''}
 
+        # After the wait above, the environment file is guaranteed to exist.
+        # Sourcing it earlier would silently skip a file that sops writes
+        # after activation, and `@var@` placeholders would stay unsubstituted.
+        ${optionalString (environmentFile != null) ''
+          set -a
+          # shellcheck disable=SC1090
+          source ${escapeShellArg environmentFile}
+          set +a
+        ''}
+
         tmux=${pkgs.tmux}/bin/tmux
         socket=${escapeShellArg socketPath}
         pidfile=${escapeShellArg "${cfg.dataDir}/${name}/.launchd.pid"}
-
-        # launchctl does not wait for the previous job to exit when it reloads a
-        # changed plist, so a new wrapper may start while the old one is still
-        # stopping. Wait for it, otherwise both would write the same files.
-        if [[ -f "$pidfile" ]]; then
-          old_pid=$(cat "$pidfile" 2>/dev/null || true)
-          if [[ "$old_pid" =~ ^[0-9]+$ ]] && [[ "$old_pid" != "$$" ]] && kill -0 "$old_pid" 2>/dev/null; then
-            echo "minecraft-server-${name}: waiting for previous instance $old_pid" >&2
-            for _ in {1..90}; do
-              if ! kill -0 "$old_pid" 2>/dev/null; then
-                break
-              fi
-              sleep 1
-            done
-          fi
-        fi
 
         # A session without a wrapper (SIGKILLed job, crash, machine reboot) is
         # still holding the world and the port: stop it before starting again.
@@ -203,9 +191,55 @@ let
             # The stop command did not take effect in time; do not leave the
             # JVM behind as an orphan holding the port.
             "$tmux" -S "$socket" kill-server 2>/dev/null
-            wait "$stop_pid"
+            # A failed stop script must not abort startup: the session (and
+            # the port) are gone either way.
+            wait "$stop_pid" || true
           fi
         }
+
+        remove_pidfile() {
+          # Another instance may have taken over the pidfile already.
+          if [[ "$(cat "$pidfile" 2>/dev/null || true)" == "$$" ]]; then
+            rm -f "$pidfile"
+          fi
+        }
+
+        # Install the trap before waiting for a previous instance: unloading the
+        # job while this wrapper is still in that wait must still stop the
+        # server and remove the pidfile.
+        # shellcheck disable=SC2329
+        on_term() {
+          set +e
+          trap - TERM INT
+
+          stop_session
+          ${service.scripts.stopPost}
+          remove_pidfile
+          exit 0
+        }
+        trap on_term TERM INT
+
+        # launchctl does not wait for the previous job to exit when it reloads a
+        # changed plist, so a new wrapper may start while the old one is still
+        # stopping. Wait for it, otherwise both would write the same files.
+        if [[ -f "$pidfile" ]]; then
+          old_pid=$(cat "$pidfile" 2>/dev/null || true)
+          # After a reboot the recorded PID may belong to an unrelated
+          # process, so check the command line before waiting for it.
+          old_cmd=$(/bin/ps -p "$old_pid" -o command= 2>/dev/null || true)
+          if [[ "$old_pid" =~ ^[0-9]+$ ]] \
+            && [[ "$old_pid" != "$$" ]] \
+            && [[ "$old_cmd" == *"minecraft-server-${name}-launchd"* ]] \
+            && kill -0 "$old_pid" 2>/dev/null; then
+            echo "minecraft-server-${name}: waiting for previous instance $old_pid" >&2
+            for _ in {1..90}; do
+              if ! kill -0 "$old_pid" 2>/dev/null; then
+                break
+              fi
+              sleep 1
+            done
+          fi
+        fi
 
         if "$tmux" -S "$socket" has-session 2>/dev/null; then
           echo "minecraft-server-${name}: stopping leftover session" >&2
@@ -214,18 +248,6 @@ let
 
         rm -f ${escapeShellArg statusFile}
         echo "$$" > "$pidfile"
-
-        # shellcheck disable=SC2329
-        on_term() {
-          set +e
-          trap - TERM INT
-
-          stop_session
-          ${service.scripts.stopPost}
-          rm -f "$pidfile"
-          exit 0
-        }
-        trap on_term TERM INT
 
         ${service.scripts.startPre}
 
@@ -237,7 +259,7 @@ let
         done
 
         ${service.scripts.stopPost}
-        rm -f "$pidfile"
+        remove_pidfile
 
         ${naturalExit}
       '';
@@ -349,8 +371,10 @@ in
   };
 
   config = mkIf cfg.enable {
-    # Keep sockets and exit status files inside the data directory. These are
-    # set with `mkDefault` so a per-server `managementSystem` can override them.
+    # Keep sockets and exit status files inside the data directory. `mkDefault`
+    # lets the host configuration override them. A per-server
+    # `managementSystem` must restate this whole block, because defining it
+    # drops the shared `default = cfg.managementSystem` for that server.
     services.minecraft-servers.managementSystem.tmux = {
       # Defining `managementSystem` here replaces the shared option's default,
       # so re-state the management system darwin supports.
@@ -392,6 +416,10 @@ in
         message = ''
           Darwin needs `managementSystem.tmux.exitStatusFile` to tell a clean
           shutdown from a crash; do not set it to `null` there.
+
+          A per-server `managementSystem` must restate `tmux.enable` and
+          `tmux.exitStatusFile`, since defining it replaces the inherited
+          defaults for that server.
         '';
       }
       {
