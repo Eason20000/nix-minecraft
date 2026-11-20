@@ -74,6 +74,9 @@ let
       # Take the socket from the service environment rather than recomputing it:
       # this is the value the start hook actually hands to tmux.
       socketPath = service.environment.STDIN_SOCKET_PATH;
+      # Path of the server executable; the start hook runs exactly this, and it
+      # is what the JVM-PID guard below looks for in the process command line.
+      serverExe = getExe conf.package;
       sources = nonStoreSources conf;
       restart = restartPolicy conf;
 
@@ -170,12 +173,61 @@ let
         tmux=${pkgs.tmux}/bin/tmux
         socket=${escapeShellArg socketPath}
         pidfile=${escapeShellArg "${cfg.dataDir}/${name}/.launchd.pid"}
+        jvmpidfile=${escapeShellArg "${cfg.dataDir}/${name}/.jvm.pid"}
+
+        # If tmux dies before the server (or the stop script is killed), nothing
+        # is left to deliver the in-game stop command. Signal the recorded JVM
+        # directly so it cannot outlive the job and keep writing the world.
+        stop_leftover_jvm() {
+          local pid
+          [[ -f "$jvmpidfile" ]] || return 0
+          pid=$(cat "$jvmpidfile" 2>/dev/null || true)
+          if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$jvmpidfile"
+            return 0
+          fi
+          # Guard against PID reuse after a reboot.
+          local cmd
+          cmd=$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)
+          if [[ "$cmd" != *"${serverExe}"* ]]; then
+            rm -f "$jvmpidfile"
+            return 0
+          fi
+          echo "minecraft-server-${name}: sending TERM to leftover JVM $pid" >&2
+          kill -TERM "$pid" 2>/dev/null || true
+          for _ in {1..30}; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "minecraft-server-${name}: killing leftover JVM $pid" >&2
+            kill -KILL "$pid" 2>/dev/null || true
+          fi
+          rm -f "$jvmpidfile"
+        }
+
+        record_jvm_pid() {
+          local pane child
+          for _ in {1..30}; do
+            pane=$("$tmux" -S "$socket" list-panes -F '#{pane_pid}' 2>/dev/null | head -1)
+            if [[ -n "$pane" ]]; then
+              child=$(/usr/bin/pgrep -P "$pane" 2>/dev/null | head -1)
+              if [[ -n "$child" ]]; then
+                echo "$child" > "$jvmpidfile"
+                return 0
+              fi
+            fi
+            sleep 1
+          done
+        }
 
         # A session without a wrapper (SIGKILLed job, crash, machine reboot) is
         # still holding the world and the port: stop it before starting again.
         stop_session() {
           local stop_pid
           if ! "$tmux" -S "$socket" has-session 2>/dev/null; then
+            echo "minecraft-server-${name}: no tmux session to stop" >&2
+            stop_leftover_jvm
             return 0
           fi
 
@@ -187,14 +239,14 @@ let
             fi
             sleep 1
           done
-          if kill -0 "$stop_pid" 2>/dev/null; then
-            # The stop command did not take effect in time; do not leave the
-            # JVM behind as an orphan holding the port.
-            "$tmux" -S "$socket" kill-server 2>/dev/null
-            # A failed stop script must not abort startup: the session (and
-            # the port) are gone either way.
-            wait "$stop_pid" || true
+          # The stop script can fail on its own (send-keys failed, or it was
+          # killed), which does not mean the server is gone.
+          if "$tmux" -S "$socket" has-session 2>/dev/null; then
+            echo "minecraft-server-${name}: stop did not end the session, killing tmux" >&2
+            "$tmux" -S "$socket" kill-server 2>/dev/null || true
           fi
+          wait "$stop_pid" || true
+          stop_leftover_jvm
         }
 
         remove_pidfile() {
@@ -212,9 +264,11 @@ let
           set +e
           trap - TERM INT
 
+          echo "minecraft-server-${name}: received TERM/INT, stopping" >&2
           stop_session
           ${service.scripts.stopPost}
           remove_pidfile
+          rm -f "$jvmpidfile"
           exit 0
         }
         trap on_term TERM INT
@@ -253,12 +307,14 @@ let
 
         ${service.scripts.start}
         ${service.scripts.startPost}
+        record_jvm_pid
 
         while "$tmux" -S "$socket" has-session 2>/dev/null; do
           sleep 2
         done
 
         ${service.scripts.stopPost}
+        stop_leftover_jvm
         remove_pidfile
 
         ${naturalExit}
@@ -278,7 +334,10 @@ let
         # on load cannot use it.
         KeepAlive = if !conf.autoStart || conf.restart == "no" then false else { SuccessfulExit = false; };
         ThrottleInterval = 15;
-        ExitTimeOut = 90;
+        # Worst case stop path: 75s waiting for the in-game command, then up to
+        # 30s waiting for the JVM after a direct SIGTERM. launchd must not
+        # SIGKILL the wrapper before that finishes, or the JVM is orphaned.
+        ExitTimeOut = 120;
         ProcessType = cfg.processType;
         StandardOutPath = "${cfg.dataDir}/${name}/logs/launchd.out.log";
         StandardErrorPath = "${cfg.dataDir}/${name}/logs/launchd.err.log";
