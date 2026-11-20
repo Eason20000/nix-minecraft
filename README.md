@@ -401,16 +401,16 @@ Each server will be under a subdirectory named after the server name, such as `/
 
 #### `runDir`
 
-Directory to place the runtime tmux sockets into. Defaults to `/run/minecraft`.
-Each server's console will be a tmux socket file in the form of servername.sock. To connect to the console, run `tmux -S /run/minecraft/servername.sock attach`, press `Ctrl + b` then `d` to detach.
+Directory to place the runtime tmux sockets into. Defaults to `/run/minecraft` (`/var/lib/minecraft/run` on nix-darwin).
+Each server's console will be a tmux socket file in the form of servername.sock. To connect to the console, run `tmux -S <socket dir>/servername.sock attach` (for example `/run/minecraft/servername.sock` on NixOS), press `Ctrl + b` then `d` to detach.
 
 #### `user` (NixOS and Darwin)
 
-Name of the user to create and run servers under. It is recommended to leave this as the default, as it is the same user as `services.minecraft-server`. On Darwin this defaults to the dedicated `_minecraft` account (see the [nix-darwin notes](#nix-darwin-notes)).
+Name of the user to create and run servers under. On NixOS it is recommended to leave this as the default, as it is the same user as `services.minecraft-server`. On Darwin it defaults to the dedicated `_minecraft` account (see the [nix-darwin notes](#nix-darwin-notes)).
 
 #### `group` (NixOS and Darwin)
 
-Name of the group to create and run servers under. In order to modify the server files or attach to the tmux socket, your user must be a part of this group. It is recommended to leave this as the default, as it is the same group as `services.minecraft-server`. On Darwin this defaults to `_minecraft`.
+Name of the group to create and run servers under. In order to modify the server files or attach to the tmux socket, your user must be a part of this group. On NixOS it is recommended to leave this as the default, as it is the same group as `services.minecraft-server`. On Darwin it defaults to `_minecraft`.
 
 #### `environmentFile`
 
@@ -670,13 +670,13 @@ before killing the tmux server.
 - `enableReload` has no effect: a changed job definition (plist) unloads and
   reloads the daemon, which restarts the server.
 - There is no port-based firewall API. Allow the server's Java binary in the
-  macOS application firewall, for example:
+  macOS application firewall. The servers use `pkgs.jdk25_headless`; if it is not
+  in `environment.systemPackages`, point `socketfilterfw` at its store path:
 
   ```console
-  $ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add \
-      "$(readlink -f /run/current-system/sw/bin/java)"
-  $ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp \
-      "$(readlink -f /run/current-system/sw/bin/java)"
+  $ java="$(nix eval --raw nixpkgs#jdk25_headless)/bin/java"
+  $ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "$java"
+  $ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$java"
   ```
 
 - Launchd applies light CPU and I/O throttling unless `ProcessType` is set, so

@@ -8,6 +8,8 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     nix-minecraft = {
+      # `darwinModules` comes from this repository's branch. Until it is
+      # merged, build with `--override-input nix-minecraft path:../..`.
       url = "github:Infinidoge/nix-minecraft";
       inputs.nixpkgs.follows = "nixpkgs";
     };
